@@ -12,11 +12,12 @@ Recomendación: crea una carpeta, por ejemplo: C:\ZWCAD\gmlv4\ y mete los dos ah
 # 2) Añade la carpeta a las rutas de soporte (para que encuentre el DCL)
 
 En ZWCAD:
-    Escribe OPTIONS (u Opciones).
-    Ve a Files (Archivos).
-    Busca Support File Search Path (Ruta de búsqueda de archivos de soporte).
-    Add (Añadir) la carpeta: C:\ZWCAD\gmlv4\
-    Acepta/OK.
+    1. Escribe OPTIONS en la línea de comandos.
+    2. Pestaña Files.
+    3. Despliega Support File Search Path.
+    4. Pulsa Add… y añade la carpeta donde has copiado los archivos C:\ZWCAD\plugins\gmlv4\
+    5. Apply / OK.
+    
 Esto es importante para que ZWCAD pueda cargar GML_PARCELA_4.dcl y te salga el diálogo.
 
 # 3) Carga el LISP
@@ -65,11 +66,12 @@ El <NOMBRE_LIMPIO> sale de:
     un TEXT/MTEXT dentro de la parcela, si existe
     si no, usa P1, P2, etc.
 
-# Problemas típicos y solución rápida
+# Detalles a tener en cuenta en ZWCAD
 
-    “Unknown command GMLV4”: no está cargado el LISP → APPLOAD y carga gmlv4.lsp.
-    No aparece el diálogo: ZWCAD no encuentra el .dcl → añade la carpeta en Support File Search Path y asegúrate de que GML_PARCELA_4.dcl está ahí.
-    Error de arcos/bulges: tu polilínea tiene curvas → convertir a polilínea con segmentos rectos.
+    Las entidades deben ser LWPOLYLINE/POLYLINE cerradas.
+    Si la polilínea tiene arcos (bulge), el plugin aborta con error (convierte a segmentos rectos antes).
+    Si no aparece el diálogo, normalmente es porque no encuentra el .dcl (revisar el paso 2).
+
 
 Si me dices qué versión de ZWCAD usas (y si es ZWCAD estándar o ZWCAD Mechanical), te indico exactamente dónde está la opción de “Support File Search Path” en tu interfaz.
 
