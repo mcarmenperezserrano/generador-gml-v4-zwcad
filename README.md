@@ -1,16 +1,77 @@
 # Generador GML v4 para ZWCAD
 
 Este es un plugin para ZWCAD que genera archivos GML v4 para parcelas catastrales, creando un archivo por cada polilínea exterior seleccionada. También puede manejar polilíneas interiores opcionales y texto interno para nombrar los archivos de salida.
+# 1) Descarga los archivos
 
-## Instalación
-1. Copie el archivo `generador-gml-v4-zwcad.lsp` en la carpeta de soporte de ZWCAD.
-2. Asegúrese de que ZWCAD pueda encontrar el plugin cargándolo en la línea de comando.
+Necesitas estos 2 archivos en tu PC:
 
-## Uso
-1. Abra ZWCAD y cargue el plugin usando el comando `GMLV4`.
-2. Seleccione las polilíneas exteriores que representan las parcelas.
-3. Elija una carpeta de salida y establezca un prefijo para `localId`.
-4. El archivo GML se generará y se guardará en la carpeta seleccionada con el formato `FECHA-LOCALID.gml`. 
+    gmlv4.lsp
+    GML_PARCELA_4.dcl
+
+Recomendación: crea una carpeta, por ejemplo: C:\ZWCAD\gmlv4\ y mete los dos ahí.
+# 2) Añade la carpeta a las rutas de soporte (para que encuentre el DCL)
+
+En ZWCAD:
+    Escribe OPTIONS (u Opciones).
+    Ve a Files (Archivos).
+    Busca Support File Search Path (Ruta de búsqueda de archivos de soporte).
+    Add (Añadir) la carpeta: C:\ZWCAD\gmlv4\
+    Acepta/OK.
+Esto es importante para que ZWCAD pueda cargar GML_PARCELA_4.dcl y te salga el diálogo.
+
+# 3) Carga el LISP
+
+Opción manual (la más fácil):
+
+    Escribe APPLOAD
+    Busca C:\ZWCAD\gmlv4\gmlv4.lsp
+    Pulsa Load (Cargar)
+    Cierra.
+    Si quieres que cargue siempre al arrancar, en la misma ventana APPLOAD suele haber “Startup Suite” (Suite de inicio). Añádelo ahí.
+    
+# 4) Ejecuta el comando
+
+En la línea de comandos escribe:
+
+    gmlv4
+
+Si todo está bien cargado, te pedirá seleccionar entidades.
+# 5) Qué seleccionar (importante)
+
+Selecciona solo polilíneas cerradas que sean el contorno exterior de cada parcela:
+
+    Tipos permitidos: LWPOLYLINE / POLYLINE
+    Deben estar cerradas
+    No se admiten arcos/bulges: si hay curvas, el plugin da error (convierte a segmentos rectos antes).
+
+# 6) Rellena el diálogo
+
+Te saldrá el diálogo (si encuentra el DCL):
+
+    Carpeta: donde guardar los .gml
+    Prefijo localId: por defecto TEMP
+
+Si no sale el diálogo, el plugin te pedirá una carpeta mediante un selector “tipo guardar .txt” (fallback). El resultado es el mismo.
+# 7) Qué genera
+
+Genera 1 GML por cada polilínea exterior seleccionada con:
+
+    CRS fijo: EPSG:25830
+    Nombre fichero: YYYYMMDD-LOCALID.gml (fecha sin guiones)
+    localId: TEMP-YYYYMMDD-HHMMSS-<NOMBRE_LIMPIO>
+
+El <NOMBRE_LIMPIO> sale de:
+
+    un TEXT/MTEXT dentro de la parcela, si existe
+    si no, usa P1, P2, etc.
+
+# Problemas típicos y solución rápida
+
+    “Unknown command GMLV4”: no está cargado el LISP → APPLOAD y carga gmlv4.lsp.
+    No aparece el diálogo: ZWCAD no encuentra el .dcl → añade la carpeta en Support File Search Path y asegúrate de que GML_PARCELA_4.dcl está ahí.
+    Error de arcos/bulges: tu polilínea tiene curvas → convertir a polilínea con segmentos rectos.
+
+Si me dices qué versión de ZWCAD usas (y si es ZWCAD estándar o ZWCAD Mechanical), te indico exactamente dónde está la opción de “Support File Search Path” en tu interfaz.
 
 ### Ejemplo de nombre de archivo
 Para una fecha de 2026-03-12, localId TEMP-20260312-122924-1A.el archivo generado será: `2026-03-12-TEMP-20260312-122924-1A.gml`.
