@@ -1,31 +1,85 @@
 ;;; ============================================================================
-;;; gmlivga.lsp - Generador GML INSPIRE CP 3.0 compatible IVGA (Catastro)
+;;; gmlivga.lsp - Generador GML para validador IVGA (Catastro)
+;;;
+;;; Basado en el patrón del GML descargado de Catastro (WFS 2.0 wrapper + CP 4.0):
+;;; - Root: <FeatureCollection xmlns="http://www.opengis.net/wfs/2.0"> ... </FeatureCollection>
+;;; - Contenido: <member><cp:CadastralParcel>...</cp:CadastralParcel></member>
+;;; - schemaLocation: WFS 2.0 + CP 4.0
+;;; - srsName: http://www.opengis.net/def/crs/EPSG/0/25830
+;;; - Geometría: MultiSurface -> Surface -> PolygonPatch -> exterior/interior -> posList
+;;;
+;;; Reglas de identificación (según FAQ Catastro coordinación):
+;;; - Si el usuario conoce la Referencia Catastral (RC): localId = RC, namespace = ES.SDGC.CP
+;;; - Si NO existe en Catastro: namespace = ES.LOCAL.CP y localId unívoco (TEMP-YYYYMMDD-HHMMSS-NOMBRE)
+;;;
+;;; Además:
+;;; - 1 GML = 1 parcela (selección de 1 polilínea cerrada exterior)
+;;; - EPSG fijo 25830
+;;; - Soporte de islas: polilíneas cerradas interiores => gml:interior
+;;; - cp:nationalCadastralReference:
+;;;     - con RC: RC
+;;;     - sin RC: localId temporal (opción A)
+;;; - cp:label:
+;;;     - texto interior si existe
+;;;     - si no, "P1"
+;;; - cp:areaValue (m2): calculado desde la polilínea
+;;; - cp:referencePoint: centro del bounding box (simple y válido)
+;;;
 ;;; Comando: gmlivga
-;;; - 1 GML = 1 parcela (1 polilínea cerrada exterior)
-;;; - EPSG fijo: 25830
-;;; - Admite islas: polilíneas cerradas interiores => gml:interior
-;;; - localId: TEMP-YYYYMMDD-HHMMSS-<NOMBRE_LIMPIO>
-;;; - fichero: YYYYMMDD-LOCALID.gml
-;;; - Limpieza NOMBRE_LIMPIO: A-Z0-9_, mayúsculas, max 32
 ;;; ============================================================================
 
 (vl-load-com)
 
 ;; -----------------------------
-;; Fecha/hora (YYYYMMDD, HHMMSS)
+;; Fecha/hora
 ;; -----------------------------
 (defun ivga:now_yyyymmdd_hhmmss ( / d)
   (setq d (rtos (getvar "CDATE") 2 6)) ; "20260316.133430"
   (list (substr d 1 8) (substr d 10 6))
 )
 
+(defun ivga:timestamp_iso ( / now ymd hms)
+  (setq now (ivga:now_yyyymmdd_hhmmss))
+  (setq ymd (car now))
+  (setq hms (cadr now))
+  (strcat (substr ymd 1 4) "-" (substr ymd 5 2) "-" (substr ymd 7 2)
+          "T" (substr hms 1 2) ":" (substr hms 3 2) ":" (substr hms 5 2))
+)
+
 ;; -----------------------------
-;; Limpieza de texto para IDs
+;; String helpers
+;; -----------------------------
+(defun ivga:trim (s)
+  (vl-string-trim " \t\r\n" (if s s ""))
+)
+
+(defun ivga:remove_spaces (s / out i c)
+  (setq out "" i 1)
+  (while (<= i (strlen s))
+    (setq c (substr s i 1))
+    (if (/= c " ") (setq out (strcat out c)))
+    (setq i (1+ i))
+  )
+  out
+)
+
+;; -----------------------------
+;; Limpieza nombre para IDs temporales
 ;; -----------------------------
 (defun ivga:is-alnum (c / a)
   (setq a (ascii c))
   (or (and (>= a 48) (<= a 57))
       (and (>= a 65) (<= a 90)))
+)
+
+(defun ivga:is-alnum-str (s / i ok c)
+  (setq i 1 ok T)
+  (while (and ok (<= i (strlen s)))
+    (setq c (substr s i 1))
+    (if (not (ivga:is-alnum c)) (setq ok nil))
+    (setq i (1+ i))
+  )
+  ok
 )
 
 (defun ivga:clean_name (s / i out c lastUnd)
@@ -63,7 +117,27 @@
 )
 
 ;; -----------------------------
-;; Geometría: bulges / vértices
+;; Preguntar RC (opcional)
+;; -----------------------------
+(defun ivga:ask_refcat ( / rc)
+  (setq rc (getstring T "\nReferencia Catastral (20) [Enter=sin RC]: "))
+  (setq rc (strcase (ivga:remove_spaces (ivga:trim rc))))
+  (if (= rc "")
+    nil
+    (progn
+      (if (and (= (strlen rc) 20) (ivga:is-alnum-str rc))
+        rc
+        (progn
+          (alert "La RC debe tener 20 caracteres (A-Z/0-9). Vuelve a intentarlo o pulsa Enter.")
+          (ivga:ask_refcat)
+        )
+      )
+    )
+  )
+)
+
+;; -----------------------------
+;; Geometría: bulges / vertices / posList / bbox / area
 ;; -----------------------------
 (defun ivga:has_bulge (edata / bulges)
   (setq bulges (vl-remove-if-not '(lambda (x) (= 42 (car x))) edata))
@@ -86,8 +160,31 @@
   out
 )
 
+(defun ivga:bbox_center (pts / xmin xmax ymin ymax p x y)
+  (if (null pts) (list 0.0 0.0)
+    (progn
+      (setq p (car pts))
+      (setq xmin (car p) xmax (car p) ymin (cadr p) ymax (cadr p))
+      (foreach p (cdr pts)
+        (setq x (car p) y (cadr p))
+        (if (< x xmin) (setq xmin x))
+        (if (> x xmax) (setq xmax x))
+        (if (< y ymin) (setq ymin y))
+        (if (> y ymax) (setq ymax y))
+      )
+      (list (/ (+ xmin xmax) 2.0) (/ (+ ymin ymax) 2.0))
+    )
+  )
+)
+
+(defun ivga:poly_area_int (ent / obj a)
+  (setq obj (vlax-ename->vla-object ent))
+  (setq a (vla-get-area obj))
+  (fix (+ a 0.5)) ; redondeo a entero
+)
+
 ;; -----------------------------
-;; Objetos interiores (texto e islas)
+;; Interior objects: texto e islas
 ;; -----------------------------
 (defun ivga:inner_objects (pts)
   (ssget "_WP" pts)
@@ -113,6 +210,7 @@
 )
 
 (defun ivga:inner_islands (ss / n i e ed islands)
+  ;; Polilíneas cerradas interiores -> islas.
   (setq islands '())
   (if ss
     (progn
@@ -140,88 +238,11 @@
 )
 
 ;; -----------------------------
-;; Carpeta salida (simple)
+;; Output folder / file write
 ;; -----------------------------
 (defun ivga:choose_output_folder ( / p)
   (setq p (getfiled "Elige carpeta de salida (selecciona/crea un fichero temporal .txt)" (getvar "DWGPREFIX") "txt" 1))
   (if p (vl-filename-directory p) nil)
-)
-
-;; -----------------------------
-;; GML CP 3.0 (IVGA)
-;; -----------------------------
-(defun ivga:gml_header ()
-  ;; Catastro IVGA suele validar CP 3.0.
-  ;; schemaLocation puede variar; si el validador pide otro, lo ajustamos.
-  (strcat
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-    "<gml:FeatureCollection gml:id=\"ES.SDGC.CP\"\n"
-    "  xmlns:gml=\"http://www.opengis.net/gml/3.2\"\n"
-    "  xmlns:cp=\"http://inspire.ec.europa.eu/schemas/cp/3.0\"\n"
-    "  xmlns:base=\"http://inspire.ec.europa.eu/schemas/base/3.3\"\n"
-    "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
-    "  xsi:schemaLocation=\"http://inspire.ec.europa.eu/schemas/cp/3.0 http://inspire.ec.europa.eu/schemas/cp/3.0/CadastralParcels.xsd\">\n"
-  )
-)
-
-(defun ivga:gml_footer ()
-  "</gml:FeatureCollection>\n"
-)
-
-(defun ivga:gml_polygon (posExterior posInteriors / interiors)
-  (setq interiors "")
-  (foreach isl posInteriors
-    (setq interiors
-      (strcat interiors
-        "                <gml:interior>\n"
-        "                  <gml:LinearRing>\n"
-        "                    <gml:posList srsDimension=\"2\">" isl "</gml:posList>\n"
-        "                  </gml:LinearRing>\n"
-        "                </gml:interior>\n"
-      )
-    )
-  )
-
-  (strcat
-    "          <gml:surfaceMember>\n"
-    "            <gml:Polygon gml:id=\"poly1\" srsName=\"urn:ogc:def:crs:EPSG::25830\">\n"
-    "              <gml:exterior>\n"
-    "                <gml:LinearRing>\n"
-    "                  <gml:posList srsDimension=\"2\">" posExterior "</gml:posList>\n"
-    "                </gml:LinearRing>\n"
-    "              </gml:exterior>\n"
-    interiors
-    "            </gml:Polygon>\n"
-    "          </gml:surfaceMember>\n"
-  )
-)
-
-(defun ivga:gml_parcel_member (localId posExterior posInteriors / geom)
-  (setq geom
-    (strcat
-      "      <cp:geometry>\n"
-      "        <gml:MultiSurface gml:id=\"MS_" localId "\" srsName=\"urn:ogc:def:crs:EPSG::25830\">\n"
-      (ivga:gml_polygon posExterior posInteriors)
-      "        </gml:MultiSurface>\n"
-      "      </cp:geometry>\n"
-    )
-  )
-
-  (strcat
-    "  <gml:featureMember>\n"
-    "    <cp:CadastralParcel gml:id=\"ES.LOCAL.CP." localId "\">\n"
-    "      <cp:inspireId>\n"
-    "        <base:Identifier>\n"
-    "          <base:localId>" localId "</base:localId>\n"
-    "          <base:namespace>ES.LOCAL.CP</base:namespace>\n"
-    "        </base:Identifier>\n"
-    "      </cp:inspireId>\n"
-    geom
-    "      <cp:label/>\n"
-    "      <cp:nationalCadastralReference/>\n"
-    "    </cp:CadastralParcel>\n"
-    "  </gml:featureMember>\n"
-  )
 )
 
 (defun ivga:write_text_file (path content / f)
@@ -233,10 +254,124 @@
 )
 
 ;; -----------------------------
-;; Comando principal: 1 parcela
+;; XML escape
 ;; -----------------------------
-(defun c:gmlivga ( / ss ent ed pts insideSS nameRaw nameClean islandsPts islandsPos now ymd hms localId outdir filePath gml)
-  ;; Selección: el usuario elige 1 polilínea cerrada exterior
+(defun ivga:xml_escape (s)
+  (if (null s) (setq s ""))
+  (setq s (vl-string-subst "&amp;" "&" s))
+  (setq s (vl-string-subst "&lt;" "<" s))
+  (setq s (vl-string-subst "&gt;" ">" s))
+  (setq s (vl-string-subst "&quot;" "\"" s))
+  s
+)
+
+;; -----------------------------
+;; GML IVGA (WFS + CP 4.0)
+;; -----------------------------
+(defun ivga:gml_header (ts)
+  (strcat
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+    "<!--Parcela Catastral de la D.G. del Catastro.-->\n"
+    "<!--La precisión es la que corresponde nominalmente a la escala de captura de la cartografía-->\n"
+    "<FeatureCollection"
+    " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""
+    " xmlns:gml=\"http://www.opengis.net/gml/3.2\""
+    " xmlns:xlink=\"http://www.w3.org/1999/xlink\""
+    " xmlns:cp=\"http://inspire.ec.europa.eu/schemas/cp/4.0\""
+    " xmlns:gmd=\"http://www.isotc211.org/2005/gmd\""
+    " xsi:schemaLocation=\"http://www.opengis.net/wfs/2.0 http://schemas.opengis.net/wfs/2.0/wfs.xsd"
+    " http://inspire.ec.europa.eu/schemas/cp/4.0 http://inspire.ec.europa.eu/schemas/cp/4.0/CadastralParcels.xsd\""
+    " xmlns=\"http://www.opengis.net/wfs/2.0\""
+    " timeStamp=\"" ts "\" numberMatched=\"1\" numberReturned=\"1\">\n"
+  )
+)
+
+(defun ivga:gml_footer ()
+  "</FeatureCollection>\n"
+)
+
+(defun ivga:gml_multisurface (id posExterior posInteriors / interiors)
+  ;; id se usa para formar gml:id de MultiSurface y Surface (estilo Catastro)
+  (setq interiors "")
+  (foreach isl posInteriors
+    (setq interiors
+      (strcat interiors
+        "  <gml:interior>\n"
+        "      <gml:LinearRing>\n"
+        "          <gml:posList srsDimension=\"2\">" isl "</gml:posList>\n"
+        "      </gml:LinearRing>\n"
+        "  </gml:interior>\n"
+      )
+    )
+  )
+
+  (strcat
+    "<gml:MultiSurface gml:id=\"MultiSurface_" id "\" srsName=\"http://www.opengis.net/def/crs/EPSG/0/25830\">\n"
+    "  <gml:surfaceMember>\n"
+    "  <gml:Surface gml:id=\"Surface_" id ".1\" srsName=\"http://www.opengis.net/def/crs/EPSG/0/25830\">\n"
+    "  <gml:patches>\n"
+    "  <gml:PolygonPatch>\n"
+    "  <gml:exterior>\n"
+    "      <gml:LinearRing>\n"
+    "          <gml:posList srsDimension=\"2\">" posExterior "</gml:posList>\n"
+    "      </gml:LinearRing>\n"
+    "  </gml:exterior>\n"
+    interiors
+    "  </gml:PolygonPatch>\n"
+    "  </gml:patches>\n"
+    "  </gml:Surface>\n"
+    "  </gml:surfaceMember>\n"
+    "</gml:MultiSurface>\n"
+  )
+)
+
+(defun ivga:gml_member (namespace localId label area refPt posExterior posInteriors / escapedLabel parcelGmlId multiId ncr)
+  (setq escapedLabel (ivga:xml_escape label))
+
+  ;; gml:id del feature (Catastro: ES.SDGC.CP.<localId>)
+  (setq parcelGmlId (strcat namespace "." localId))
+
+  ;; ids geom
+  (setq multiId (strcat namespace "." localId))
+
+  ;; national cadastral reference: RC si existe, si no localId temporal (opción A)
+  (setq ncr localId)
+
+  (strcat
+    "<member>\n"
+    "<cp:CadastralParcel gml:id=\"" parcelGmlId "\">\n"
+    "<cp:areaValue uom=\"m2\">" (itoa area) "</cp:areaValue>\n"
+    "<cp:beginLifespanVersion xsi:nil=\"true\" nilReason=\"http://inspire.ec.europa.eu/codelist/VoidReasonValue/Unpopulated\"></cp:beginLifespanVersion>\n"
+    "<cp:endLifespanVersion xsi:nil=\"true\" nilReason=\"http://inspire.ec.europa.eu/codelist/VoidReasonValue/Unpopulated\"></cp:endLifespanVersion>\n"
+    "<cp:geometry>\n"
+    (ivga:gml_multisurface (strcat parcelGmlId) posExterior posInteriors)
+    "</cp:geometry>\n"
+    "<cp:inspireId>\n"
+    "<Identifier xmlns=\"http://inspire.ec.europa.eu/schemas/base/3.3\">\n"
+    "  <localId>" localId "</localId>\n"
+    "  <namespace>" namespace "</namespace>\n"
+    "</Identifier>\n"
+    "</cp:inspireId>\n"
+    "<cp:label>" escapedLabel "</cp:label>\n"
+    "<cp:nationalCadastralReference>" ncr "</cp:nationalCadastralReference>\n"
+    "<cp:referencePoint>\n"
+    "<gml:Point gml:id=\"ReferencePoint_" parcelGmlId "\" srsName=\"http://www.opengis.net/def/crs/EPSG/0/25830\">\n"
+    "  <gml:pos>" (rtos (car refPt) 2 2) " " (rtos (cadr refPt) 2 2) "</gml:pos>\n"
+    "</gml:Point>\n"
+    "</cp:referencePoint>\n"
+    "</cp:CadastralParcel>\n"
+    "</member>\n"
+  )
+)
+
+;; -----------------------------
+;; Command: gmlivga (1 parcela)
+;; -----------------------------
+(defun c:gmlivga ( / ss ent ed pts insideSS nameRaw label nameClean islandsPts islandsPos now ymd hms outdir filePath gml area refPt ts rc namespace localId)
+
+  (prompt "\nGML IVGA (Catastro): selecciona 1 polilínea cerrada (parcela).")
+
+  ;; Selección única
   (setq ss (ssget "_:S" '((0 . "POLYLINE,LWPOLYLINE") (70 . 1))))
   (if (null ss)
     (progn (prompt "\nNo se ha seleccionado ninguna polilínea cerrada.") (princ))
@@ -244,7 +379,6 @@
       (setq ent (ssname ss 0))
       (setq ed (entget ent))
 
-      ;; arcos/bulges -> no permitido
       (if (ivga:has_bulge ed)
         (progn (alert "ERROR: La polilínea exterior contiene arcos/bulges. Convierte a segmentos rectos.") (exit))
       )
@@ -252,33 +386,56 @@
       (setq pts (ivga:poly_vertices ed))
       (setq insideSS (ivga:inner_objects pts))
 
-      ;; nombre: texto interior o P1
+      ;; label: texto interior si hay, si no P1
       (setq nameRaw (ivga:first_text_inside insideSS))
       (if (or (null nameRaw) (= nameRaw "")) (setq nameRaw "P1"))
-      (setq nameClean (ivga:clean_name nameRaw))
+      (setq label nameRaw)
 
-      ;; islas interiores
+      ;; islas
       (setq islandsPts (ivga:inner_islands insideSS))
       (setq islandsPos '())
       (foreach islPts islandsPts
         (setq islandsPos (cons (ivga:poslist_from_pts islPts) islandsPos))
       )
 
-      ;; salida
+      ;; área y reference point
+      (setq area (ivga:poly_area_int ent))
+      (setq refPt (ivga:bbox_center pts))
+
+      ;; carpeta salida
       (setq outdir (ivga:choose_output_folder))
       (if (null outdir) (progn (alert "Cancelado.") (exit)))
 
+      ;; timestamp WFS y fecha para nombre fichero
+      (setq ts (ivga:timestamp_iso))
       (setq now (ivga:now_yyyymmdd_hhmmss))
       (setq ymd (car now))
       (setq hms (cadr now))
 
-      (setq localId (strcat "TEMP-" ymd "-" hms "-" nameClean))
+      ;; Preguntar RC opcional
+      (setq rc (ivga:ask_refcat))
+
+      (if rc
+        (progn
+          ;; Con RC conocida (parcela existente / o se desea conservar RC)
+          (setq namespace "ES.SDGC.CP")
+          (setq localId rc)
+        )
+        (progn
+          ;; Sin RC: parcela no existente en Catastro => ES.LOCAL.CP + id unívoco
+          (setq namespace "ES.LOCAL.CP")
+          (setq nameClean (ivga:clean_name nameRaw))
+          (setq localId (strcat "TEMP-" ymd "-" hms "-" nameClean))
+        )
+      )
+
+      ;; Nombre fichero: YYYYMMDD-LOCALID.gml
       (setq filePath (strcat outdir "\\" ymd "-" localId ".gml"))
 
       (setq gml
         (strcat
-          (ivga:gml_header)
-          (ivga:gml_parcel_member localId (ivga:poslist_from_pts pts) islandsPos)
+          (ivga:gml_header ts)
+          (ivga:gml_member namespace localId label area refPt (ivga:poslist_from_pts pts) islandsPos)
           (ivga:gml_footer)
         )
       )
